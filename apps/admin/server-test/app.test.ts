@@ -1,4 +1,7 @@
 // @vitest-environment node
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../server/app.js";
@@ -25,7 +28,7 @@ describe("Loop Engineering Admin API", () => {
   });
 
   async function demoApp(): Promise<FastifyInstance> {
-    app = await buildApp({ databasePath: ":memory:", demo: true, enableTestAuthHeaders: true });
+    app = await buildApp({ databasePath: ":memory:", demo: true, demoRunSourceMode: "managed", enableTestAuthHeaders: true });
     await app.ready();
     return app;
   }
@@ -36,8 +39,171 @@ describe("Loop Engineering Admin API", () => {
     return app;
   }
 
+  async function activateStageInOrder(api: FastifyInstance, runId: string, targetStageId: string): Promise<any> {
+    const detail = (await api.inject({ method: "GET", url: `/api/runs/${runId}` })).json();
+    const target = detail.stages.find((stage: any) => stage.id === targetStageId);
+    if (!target) throw new Error(`Missing target stage ${targetStageId}`);
+    for (const stage of detail.stages.filter((candidate: any) => candidate.position <= target.position)) {
+      if (["passed", "skipped"].includes(stage.status)) continue;
+      if (stage.status === "pending") {
+        const activated = await api.inject({
+          method: "PATCH",
+          url: `/api/runs/${runId}/stages/${stage.id}`,
+          headers: OPERATOR,
+          payload: { status: "active" },
+        });
+        expect(activated.statusCode).toBe(200);
+      }
+      if (stage.id === targetStageId) return (await api.inject({ method: "GET", url: `/api/runs/${runId}` }))
+        .json().stages.find((candidate: any) => candidate.id === targetStageId);
+      const passed = await api.inject({
+        method: "PATCH",
+        url: `/api/runs/${runId}/stages/${stage.id}`,
+        headers: OPERATOR,
+        payload: { status: "passed" },
+      });
+      expect(passed.statusCode).toBe(200);
+    }
+    throw new Error(`Unable to activate target stage ${targetStageId}`);
+  }
+
+  it("initializes a fresh operational workspace without fake execution records", async () => {
+    const api = await freshApp();
+    expect((await api.inject({ method: "GET", url: "/api/session" })).json()).toMatchObject({
+      demo: false,
+      dataMode: "operational",
+    });
+    expect((await api.inject({ method: "GET", url: "/api/loops" })).json()).toMatchObject([{
+      id: "general-development",
+      name: "General development",
+      enabled: true,
+    }]);
+    expect((await api.inject({ method: "GET", url: "/api/runs" })).json()).toEqual([]);
+    expect((await api.inject({ method: "GET", url: "/api/agents" })).json()).toEqual([]);
+    expect((await api.inject({ method: "GET", url: "/api/events" })).json()).toEqual([]);
+    expect((await api.inject({ method: "GET", url: "/api/approvals" })).json()).toEqual([]);
+    expect((await api.inject({ method: "GET", url: "/api/audit" })).json()).toEqual([]);
+    expect((await api.inject({ method: "GET", url: "/api/settings/global-pause" })).json()).toMatchObject({
+      paused: false,
+      version: 1,
+    });
+    expect((await api.inject({ method: "GET", url: "/api/overview" })).json()).toMatchObject({
+      connection: {
+        mode: "managed",
+        status: "connected",
+        lastEventAt: null,
+      },
+    });
+  });
+
+  it("stores opt-in demo identity and truthful snapshot provenance across restarts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "loop-admin-demo-"));
+    const databasePath = join(directory, "demo.db");
+    try {
+      app = await buildApp({ databasePath, demo: true });
+      await app.ready();
+      expect((await app.inject({ method: "GET", url: "/api/session" })).json()).toMatchObject({
+        demo: true,
+        dataMode: "demo",
+        permissions: { read: true, operate: false, administer: false },
+      });
+      const runs = (await app.inject({ method: "GET", url: "/api/runs" })).json();
+      expect(runs).toHaveLength(3);
+      expect(runs.every((run: any) => run.sourceMode === "snapshot")).toBe(true);
+      const events = (await app.inject({ method: "GET", url: "/api/events?limit=200" })).json();
+      expect(events.length).toBeGreaterThan(0);
+      expect(events.every((event: any) => event.provenance === "snapshot")).toBe(true);
+      const detail = (await app.inject({ method: "GET", url: "/api/runs/run-webhook" })).json();
+      expect(detail.evidence.every((item: any) => item.provenance === "snapshot")).toBe(true);
+      const mutateDemo = await app.inject({
+        method: "POST",
+        url: "/api/runs",
+        payload: { goal: "Must not mix real work into sample history", requirements: TEST_REQUIREMENTS },
+      });
+      expect(mutateDemo.statusCode).toBe(409);
+      expect(mutateDemo.json().error.code).toBe("DEMO_READ_ONLY");
+      await app.close();
+      app = undefined;
+
+      app = await buildApp({ databasePath, demo: false });
+      await app.ready();
+      expect((await app.inject({ method: "GET", url: "/api/session" })).json()).toMatchObject({
+        demo: true,
+        dataMode: "demo",
+      });
+      expect((await app.inject({ method: "GET", url: "/api/runs" })).json()).toHaveLength(3);
+    } finally {
+      await app?.close();
+      app = undefined;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("exposes writable managed fixtures only through the explicit test-only mode", async () => {
+    app = await buildApp({ databasePath: ":memory:", e2eFixture: true });
+    await app.ready();
+    const session = (await app.inject({ method: "GET", url: "/api/session" })).json();
+    expect(session).toMatchObject({ demo: false, dataMode: "operational", permissions: { operate: true } });
+    const runs = (await app.inject({ method: "GET", url: "/api/runs" })).json();
+    expect(runs).toHaveLength(3);
+    expect(runs.every((run: any) => run.sourceMode === "managed")).toBe(true);
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { goal: "Exercise the writable browser fixture", requirements: TEST_REQUIREMENTS },
+    });
+    expect(created.statusCode).toBe(201);
+  });
+
+  it("persistently identifies legacy sample IDs as demo data", async () => {
+    const db = openDatabase(":memory:");
+    seedDemoData(db, { runSourceMode: "managed" });
+    db.prepare("DELETE FROM settings WHERE key = 'workspace_data_mode'").run();
+    app = await buildApp({ database: db, demo: false });
+    await app.ready();
+    try {
+      expect((await app.inject({ method: "GET", url: "/api/session" })).json()).toMatchObject({
+        demo: true,
+        dataMode: "demo",
+      });
+      expect(db.prepare("SELECT value FROM settings WHERE key = 'workspace_data_mode'").get()).toEqual({ value: "demo" });
+    } finally {
+      await app.close();
+      app = undefined;
+      db.close();
+    }
+  });
+
+  it("refuses to relabel an unmarked database containing operational runs as demo", async () => {
+    const db = openDatabase(":memory:");
+    try {
+      app = await buildApp({ database: db, demo: false, enableTestAuthHeaders: true });
+      await app.ready();
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/runs",
+        headers: OPERATOR,
+        payload: { goal: "Preserve a real local run", requirements: TEST_REQUIREMENTS },
+      });
+      expect(created.statusCode).toBe(201);
+      await app.close();
+      app = undefined;
+
+      db.prepare("DELETE FROM settings WHERE key = 'workspace_data_mode'").run();
+      await expect(buildApp({ database: db, demo: true })).rejects.toThrow(
+        "Refusing to label a database with existing operational runs as demo",
+      );
+      expect(db.prepare("SELECT value FROM settings WHERE key = 'workspace_data_mode'").get()).toBeUndefined();
+      expect(db.prepare("SELECT COUNT(*) AS count FROM runs").get()).toEqual({ count: 1 });
+    } finally {
+      await app?.close();
+      app = undefined;
+      db.close();
+    }
+  });
+
   it("ignores caller-supplied role headers unless test auth is explicitly enabled", async () => {
-    app = await buildApp({ databasePath: ":memory:", demo: true });
+    app = await buildApp({ databasePath: ":memory:", demo: true, demoRunSourceMode: "managed" });
     await app.ready();
     const session = await app.inject({ method: "GET", url: "/api/session", headers: VIEWER });
     expect(session.statusCode).toBe(200);
@@ -58,7 +224,7 @@ describe("Loop Engineering Admin API", () => {
     expect(() => assertSecureBind("0.0.0.0", undefined)).toThrow(/LOOP_ADMIN_TOKEN/);
     expect(() => assertSecureBind("192.168.1.20", "local-secret")).not.toThrow();
 
-    app = await buildApp({ databasePath: ":memory:", demo: true, authToken: "local-secret" });
+    app = await buildApp({ databasePath: ":memory:", demo: true, demoRunSourceMode: "managed", authToken: "local-secret" });
     await app.ready();
     const missing = await app.inject({ method: "GET", url: "/api/health" });
     expect(missing.statusCode).toBe(401);
@@ -168,6 +334,81 @@ describe("Loop Engineering Admin API", () => {
     expect(mutateSnapshot.json().error.code).toBe("SNAPSHOT_READ_ONLY");
   });
 
+  it("enforces active-run, ordered-stage, and single-open-stage invariants", async () => {
+    const api = await freshApp();
+    const run = (await api.inject({
+      method: "POST",
+      url: "/api/runs",
+      headers: OPERATOR,
+      payload: { goal: "Exercise the ordered stage state machine", requirements: TEST_REQUIREMENTS },
+    })).json();
+    let detail = (await api.inject({ method: "GET", url: `/api/runs/${run.id}` })).json();
+    const [trigger, intake, , , , maker] = detail.stages;
+
+    const queuedActivation = await api.inject({
+      method: "PATCH",
+      url: `/api/runs/${run.id}/stages/${trigger.id}`,
+      headers: OPERATOR,
+      payload: { status: "active" },
+    });
+    expect(queuedActivation.statusCode).toBe(409);
+    expect(queuedActivation.json().error.code).toBe("RUN_NOT_ACTIVE");
+
+    await api.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/actions`,
+      headers: OPERATOR,
+      payload: { action: "start", expectedStatus: "queued" },
+    });
+    const outOfOrder = await api.inject({
+      method: "PATCH",
+      url: `/api/runs/${run.id}/stages/${maker.id}`,
+      headers: OPERATOR,
+      payload: { status: "active" },
+    });
+    expect(outOfOrder.statusCode).toBe(409);
+    expect(outOfOrder.json().error.code).toBe("STAGE_ORDER");
+
+    expect((await api.inject({
+      method: "PATCH",
+      url: `/api/runs/${run.id}/stages/${trigger.id}`,
+      headers: OPERATOR,
+      payload: { status: "active" },
+    })).statusCode).toBe(200);
+    const parallelActivation = await api.inject({
+      method: "PATCH",
+      url: `/api/runs/${run.id}/stages/${intake.id}`,
+      headers: OPERATOR,
+      payload: { status: "active" },
+    });
+    expect(parallelActivation.statusCode).toBe(409);
+    expect(parallelActivation.json().error.code).toBe("STAGE_ORDER");
+
+    expect((await api.inject({
+      method: "PATCH",
+      url: `/api/runs/${run.id}/stages/${trigger.id}`,
+      headers: OPERATOR,
+      payload: { status: "passed" },
+    })).statusCode).toBe(200);
+    detail = (await api.inject({ method: "GET", url: `/api/runs/${run.id}` })).json();
+    expect(detail.run.currentStageId).toBeNull();
+
+    await api.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/actions`,
+      headers: OPERATOR,
+      payload: { action: "pause", reason: "Verify paused-stage protection", expectedStatus: "running" },
+    });
+    const pausedActivation = await api.inject({
+      method: "PATCH",
+      url: `/api/runs/${run.id}/stages/${intake.id}`,
+      headers: OPERATOR,
+      payload: { status: "active" },
+    });
+    expect(pausedActivation.statusCode).toBe(409);
+    expect(pausedActivation.json().error.code).toBe("RUN_NOT_ACTIVE");
+  });
+
   it("ingests a complete structured runtime lifecycle without seed data", async () => {
     const api = await freshApp();
     const createdResponse = await api.inject({
@@ -196,14 +437,7 @@ describe("Loop Engineering Admin API", () => {
     const makerStage = detail.stages.find((stage: any) => stage.role === "maker");
     const humanStage = detail.stages.find((stage: any) => stage.role === "human");
     const requirement = detail.requirements[0];
-    for (const stage of [makerStage, humanStage]) {
-      expect((await api.inject({
-        method: "PATCH",
-        url: `/api/runs/${runId}/stages/${stage.id}`,
-        headers: OPERATOR,
-        payload: { status: "active" },
-      })).statusCode).toBe(200);
-    }
+    await activateStageInOrder(api, runId, makerStage.id);
 
     const fact = (payload: Record<string, unknown>) => api.inject({
       method: "POST",
@@ -379,6 +613,42 @@ describe("Loop Engineering Admin API", () => {
     expect(crossRun.statusCode).toBe(422);
     expect(crossRun.json().error.code).toBe("INVALID_REFERENCE");
 
+    expect((await fact({
+      id: "fact-fresh-agent-prose",
+      type: "requirement.evidence",
+      evidenceId: "fresh-agent-prose",
+      requirementId: requirement.id,
+      attemptId: "fresh-attempt",
+      agentId: "fresh-maker",
+      sessionId: "fresh-maker-session",
+      kind: "other",
+      status: "pass",
+      summary: "The maker states that the requirement is complete",
+      artifactDigest: SHA_B,
+      provenance: "agent_reported",
+    })).statusCode).toBe(201);
+    const proseOnlyVerdict = await api.inject({
+      method: "POST",
+      url: `/api/runs/${runId}/checker-verdicts`,
+      headers: OPERATOR,
+      payload: {
+        attemptId: "fresh-attempt",
+        checkerAgentId: "fresh-checker",
+        checkerSessionId: "fresh-checker-session",
+        verdict: "approve",
+        summary: "Maker prose alone must not be sufficient",
+        artifactDigest: SHA_B,
+        requirementResults: [{
+          requirementId: requirement.id,
+          status: "pass",
+          evidenceIds: ["fresh-agent-prose"],
+          note: "No deterministic command attached",
+        }],
+      },
+    });
+    expect(proseOnlyVerdict.statusCode).toBe(422);
+    expect(proseOnlyVerdict.json().error.code).toBe("DETERMINISTIC_EVIDENCE_REQUIRED");
+
     const verdict = await api.inject({
       method: "POST",
       url: `/api/runs/${runId}/checker-verdicts`,
@@ -399,6 +669,14 @@ describe("Loop Engineering Admin API", () => {
       },
     });
     expect(verdict.statusCode).toBe(201);
+
+    expect((await api.inject({
+      method: "PATCH",
+      url: `/api/runs/${runId}/stages/${makerStage.id}`,
+      headers: OPERATOR,
+      payload: { status: "passed" },
+    })).statusCode).toBe(200);
+    await activateStageInOrder(api, runId, humanStage.id);
 
     const approvalPayload = {
       id: "fact-fresh-approval",
@@ -474,19 +752,21 @@ describe("Loop Engineering Admin API", () => {
     detail = (await api.inject({ method: "GET", url: `/api/runs/${runId}` })).json();
     expect(detail).toMatchObject({
       attempts: [{ id: "fresh-attempt", status: "success", artifactDigest: SHA_B }],
-      evidence: [{ id: "fresh-evidence", status: "pass", artifactDigest: SHA_B }],
       verifications: [{ id: "fresh-verification", status: "passed" }],
       approvals: [{ id: "fresh-approval", status: "approved", evidenceDigest: SHA_B }],
       artifacts: [{ id: "fresh-artifact", digest: SHA_B }],
       worktrees: [{ id: "fresh-worktree", commit: "abc123", dirty: false }],
     });
+    expect(detail.evidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "fresh-evidence", status: "pass", artifactDigest: SHA_B }),
+    ]));
     expect(detail.events.some((event: any) => event.type === "approval.requested")).toBe(true);
     expect(detail.audit.some((entry: any) => entry.action === "runtime_fact.requirement.evidence")).toBe(true);
   });
 
   it("marks missed heartbeats stale, accepts recovery, and records failed attempt completion", async () => {
     const db = openDatabase(":memory:");
-    app = await buildApp({ database: db, demo: false, enableTestAuthHeaders: true });
+    app = await buildApp({ database: db, demo: false, demoRunSourceMode: "managed", enableTestAuthHeaders: true });
     await app.ready();
     try {
       const api = app;
@@ -504,12 +784,7 @@ describe("Loop Engineering Admin API", () => {
       });
       const runDetail = (await api.inject({ method: "GET", url: `/api/runs/${run.id}` })).json();
       const makerStage = runDetail.stages.find((stage: any) => stage.role === "maker");
-      await api.inject({
-        method: "PATCH",
-        url: `/api/runs/${run.id}/stages/${makerStage.id}`,
-        headers: OPERATOR,
-        payload: { status: "active" },
-      });
+      await activateStageInOrder(api, run.id, makerStage.id);
       const heartbeat = {
         type: "agent.heartbeat",
         agentId: "failure-maker",
@@ -646,10 +921,46 @@ describe("Loop Engineering Admin API", () => {
     expect(newRun.requirements[0].status).toBe("pending");
   });
 
+  it("atomically reconciles child state and revokes approvals when a run terminates", async () => {
+    const api = await demoApp();
+    const cancelled = await api.inject({
+      method: "POST",
+      url: "/api/runs/run-webhook/actions",
+      headers: OPERATOR,
+      payload: { action: "cancel", reason: "Stop the local execution", expectedStatus: "running" },
+    });
+    expect(cancelled.statusCode).toBe(200);
+    const cancelledDetail = (await api.inject({ method: "GET", url: "/api/runs/run-webhook" })).json();
+    expect(cancelledDetail.run).toMatchObject({ status: "cancelled", currentStageId: null });
+    expect(cancelledDetail.attempts.find((attempt: any) => attempt.id === "attempt-webhook-2").status).toBe("cancelled");
+    expect(cancelledDetail.agents.filter((agent: any) => agent.status === "running" || agent.status === "waiting")).toHaveLength(0);
+    expect(cancelledDetail.stages.filter((stage: any) => ["active", "waiting", "blocked", "pending"].includes(stage.status)))
+      .toHaveLength(0);
+    expect(cancelledDetail.worktrees.find((worktree: any) => worktree.id === "worktree-webhook-2").status).toBe("stale");
+
+    const cancelledRelease = await api.inject({
+      method: "POST",
+      url: "/api/runs/run-release/actions",
+      headers: OPERATOR,
+      payload: { action: "cancel", reason: "Withdraw the release", expectedStatus: "waiting" },
+    });
+    expect(cancelledRelease.statusCode).toBe(200);
+    const releaseDetail = (await api.inject({ method: "GET", url: "/api/runs/run-release" })).json();
+    expect(releaseDetail.approvals[0]).toMatchObject({ status: "revoked", decidedBy: "test-operator" });
+    const lateDecision = await api.inject({
+      method: "PATCH",
+      url: "/api/approvals/approval-release/decision",
+      headers: OPERATOR,
+      payload: { decision: "approved", reason: "Too late", expectedVersion: 2 },
+    });
+    expect(lateDecision.statusCode).toBe(409);
+    expect(lateDecision.json().error.code).toBe("TERMINAL_RUN");
+  });
+
   it("rejects terminal and same-state mutations without changing versions, timestamps, or events", async () => {
     const db = openDatabase(":memory:");
-    seedDemoData(db);
-    app = await buildApp({ database: db, demo: false, enableTestAuthHeaders: true });
+    seedDemoData(db, { runSourceMode: "managed" });
+    app = await buildApp({ database: db, demo: false, demoRunSourceMode: "managed", enableTestAuthHeaders: true });
     await app.ready();
     try {
       const terminalRunBefore = db.prepare(`SELECT status, finished_at, updated_at, version, last_sequence
@@ -728,8 +1039,8 @@ describe("Loop Engineering Admin API", () => {
     "rejects checker verdicts for maker-finished %s attempts without side effects",
     async (attemptStatus) => {
       const db = openDatabase(":memory:");
-      seedDemoData(db);
-      app = await buildApp({ database: db, demo: false, enableTestAuthHeaders: true });
+      seedDemoData(db, { runSourceMode: "managed" });
+      app = await buildApp({ database: db, demo: false, demoRunSourceMode: "managed", enableTestAuthHeaders: true });
       await app.ready();
       try {
         const frozenFinishedAt = "2026-07-15T01:02:03.000Z";
@@ -1309,7 +1620,7 @@ describe("Loop Engineering Admin API", () => {
 
   it("replays more than 2,000 queued SSE events without dropping a page", async () => {
     const db = openDatabase(":memory:");
-    seedDemoData(db);
+    seedDemoData(db, { runSourceMode: "managed" });
     const timestamp = new Date().toISOString();
     transaction(db, () => {
       const insert = db.prepare(`INSERT INTO events(id, run_id, sequence, stage_id, attempt_id, type, severity,

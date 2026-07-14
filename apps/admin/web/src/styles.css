@@ -70,6 +70,10 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; fo
 .main-column { min-height: 100vh; margin-left: 236px; display: flex; flex-direction: column; }
 main { width: 100%; max-width: 1680px; flex: 1; padding: 30px 34px 42px; margin: 0 auto; }
 .app-footer { min-height: 40px; padding: 10px 34px; display: flex; align-items: center; justify-content: center; gap: 6px; border-top: 1px solid var(--border); color: var(--faint); font-size: 11px; background: var(--surface); }
+.sample-workspace-banner { min-height: 44px; margin-bottom: 18px; padding: 9px 13px; display: flex; align-items: center; gap: 10px; color: #705110; background: var(--amber-bg); border: 1px solid #e8d2a5; border-radius: 5px; }
+.sample-workspace-banner > div { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 9px; }
+.sample-workspace-banner strong { font-size: 12px; }
+.sample-workspace-banner span { color: #765d2b; font-size: 11px; line-height: 1.4; }
 
 .page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 22px; margin-bottom: 21px; }
 .page-header > div:first-child { min-width: 0; }

@@ -77,7 +77,7 @@ const review: ReviewRecord = {
 };
 
 describe("completion guard", () => {
-  it("accepts current passing evidence and a digest-bound checker approval", () => {
+  it("accepts a deterministic runtime record for the current artifact", () => {
     expect(() => assertRunCanSucceed({
       requirements: [requirement],
       evidence: [evidence],
@@ -86,13 +86,56 @@ describe("completion guard", () => {
     })).not.toThrow();
   });
 
-  it("rejects agent completion claims without deterministic evidence", () => {
+  it("rejects agent-reported prose as deterministic evidence", () => {
     expect(() => assertRunCanSucceed({
       requirements: [requirement],
-      evidence: [],
+      evidence: [{
+        ...evidence,
+        kind: "review",
+        command: null,
+        exitCode: null,
+        provenance: "agent_reported",
+        summary: "The agent reports that the requirement is complete.",
+      }],
+      reviews: [review],
+      currentAttempt: attempt,
+    })).toThrow("no deterministic runtime evidence");
+  });
+
+  it("rejects runtime evidence without a command", () => {
+    expect(() => assertRunCanSucceed({
+      requirements: [requirement],
+      evidence: [{ ...evidence, command: "   " }],
+      reviews: [review],
+      currentAttempt: attempt,
+    })).toThrow("no deterministic runtime evidence");
+  });
+
+  it.each([1, null])("rejects runtime evidence with exit code %s", (exitCode) => {
+    expect(() => assertRunCanSucceed({
+      requirements: [requirement],
+      evidence: [{ ...evidence, exitCode }],
+      reviews: [review],
+      currentAttempt: attempt,
+    })).toThrow("no deterministic runtime evidence");
+  });
+
+  it.each(["sha256:stale", null])("rejects runtime evidence with artifact digest %s", (artifactDigest) => {
+    expect(() => assertRunCanSucceed({
+      requirements: [requirement],
+      evidence: [{ ...evidence, artifactDigest }],
       reviews: [review],
       currentAttempt: attempt,
     })).toThrow(CompletionGuardError);
+  });
+
+  it("rejects deterministic evidence replayed from an older attempt", () => {
+    expect(() => assertRunCanSucceed({
+      requirements: [requirement],
+      evidence: [{ ...evidence, attemptId: "attempt-1" }],
+      reviews: [review],
+      currentAttempt: attempt,
+    })).toThrow("no deterministic runtime evidence");
   });
 
   it("invalidates a checker verdict when the artifact changes", () => {

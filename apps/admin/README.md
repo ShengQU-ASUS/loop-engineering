@@ -15,11 +15,27 @@ npm run admin
 ```
 
 The first run installs workspace dependencies, creates
-`.loop-admin/control-plane.db`, adds a generic software-development example,
-and starts the API and web UI. Open <http://127.0.0.1:5173>.
+`.loop-admin/control-plane.db`, builds the production application, and starts
+one API/UI server. Open <http://127.0.0.1:8787>.
+
+A fresh operational database contains the required workspace settings and one
+reusable `General development` loop definition. It contains zero fabricated
+runs, agents, events, approvals, or audit entries. Create the first real run in
+the UI or CLI.
 
 No Docker, Rancher, external database, or cloud account is required. The server
 binds to loopback by default.
+
+Optional sample data is explicit and isolated:
+
+```bash
+npm run admin -- --demo
+```
+
+Demo mode uses `.loop-admin/demo.db`. Its identity is persisted in SQLite and
+reported as `dataMode: "demo"` by `/api/session`; restarting that database
+cannot make it appear operational. Sample runs are read-only `snapshot`
+records, and their events and evidence use snapshot provenance.
 
 ## Commands
 
@@ -34,6 +50,20 @@ npm run admin:cli -- --help
 npm run admin:run -- --run <id> --stage <id> -- npm test
 ```
 
+`npm run admin` is the normal end-user command. It builds and serves the static
+UI and API from one process on port 8787. `admin:dev` is the developer-only
+watch mode: Vite runs on 5173 and proxies the API on 8787.
+
+Startup options are cross-platform and do not require editing environment
+files:
+
+```bash
+npm run admin -- --port 9000
+npm run admin -- --db ./local-data/control-plane.db
+npm run admin -- --demo
+npm run admin -- --help
+```
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -41,11 +71,18 @@ npm run admin:run -- --run <id> --stage <id> -- npm test
 | `LOOP_ADMIN_HOST` | `127.0.0.1` | API bind host |
 | `LOOP_ADMIN_PORT` | `8787` | API and production UI port |
 | `LOOP_ADMIN_DB` | `.loop-admin/control-plane.db` | SQLite database path, or `:memory:` in tests |
-| `LOOP_ADMIN_DEMO` | first run only | Seed a generic feature-development loop when the DB is empty |
+| `LOOP_ADMIN_DEMO` | `0` | Set to `1` to opt into persistent snapshot demo data |
 | `LOOP_ADMIN_TOKEN` | unset | Bearer token required when the API binds beyond loopback |
 
-The Vite development UI runs on port 5173 and proxies `/api` to port 8787.
-Production builds serve the static frontend and API from port 8787.
+Without an explicit `LOOP_ADMIN_DB`, demo mode uses `.loop-admin/demo.db` and
+normal mode uses `.loop-admin/control-plane.db`. Passing `--demo` or setting
+`LOOP_ADMIN_DEMO=1` against a database already marked operational is rejected.
+This prevents sample rows from entering real execution history.
+
+The launcher recognizes legacy databases containing the exact former sample
+runs (`run-webhook`, `run-release`, and `run-deps`), marks them persistently as
+demo, preserves the file, and starts a clean `.loop-admin/operational.db`
+instead. An explicit `--db` path is always respected.
 
 The default server listens only on `127.0.0.1`. A non-loopback
 `LOOP_ADMIN_HOST` is rejected unless `LOOP_ADMIN_TOKEN` is set:

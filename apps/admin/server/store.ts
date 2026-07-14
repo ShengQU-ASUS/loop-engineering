@@ -7,6 +7,7 @@ import {
   assertRunCanSucceed,
   assertRunTransition,
   assertStageTransition,
+  isDeterministicRuntimeEvidence,
   isTerminalRun,
   redactText,
   redactValue,
@@ -631,6 +632,8 @@ export class ControlPlaneStore {
     const succeededRuns = Number(outcomeMetrics.succeeded_runs ?? 0);
     const latestEvent = this.db.prepare("SELECT MAX(received_at) AS at FROM events").get() as Row;
     const hasManagedRuns = Number((this.db.prepare("SELECT EXISTS(SELECT 1 FROM runs WHERE source_mode = 'managed') AS value").get() as Row).value) === 1;
+    const workspaceDataMode = (this.db.prepare("SELECT value FROM settings WHERE key = 'workspace_data_mode'").get() as Row | undefined)?.value;
+    const connectionMode = workspaceDataMode === "operational" || hasManagedRuns ? "managed" : "snapshot";
     const globalPause = this.getGlobalPause().paused;
     const attention: OverviewResponse["attention"] = [];
 
@@ -679,8 +682,8 @@ export class ControlPlaneStore {
     return {
       generatedAt: now(),
       connection: {
-        mode: hasManagedRuns ? "managed" : "snapshot",
-        status: latestEvent.at ? "connected" : "degraded",
+        mode: connectionMode,
+        status: latestEvent.at || connectionMode === "managed" ? "connected" : "degraded",
         lastEventAt: latestEvent.at ?? null,
         globalPause,
       },
@@ -821,13 +824,18 @@ export class ControlPlaneStore {
       const result = this.db.prepare(`UPDATE runs SET status = ?,
         started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
         finished_at = CASE WHEN ? IN ('succeeded','failed','timed_out','cancelled','capped') THEN ? ELSE NULL END,
+        current_stage_id = CASE WHEN ? IN ('succeeded','failed','timed_out','cancelled','capped') THEN NULL ELSE current_stage_id END,
         waiting_reason = NULL, blocked_owner = NULL, unblock_condition = NULL,
         updated_at = ?, version = version + 1 WHERE id = ? AND status = ?`)
-        .run(nextStatus, nextStatus, timestamp, nextStatus, timestamp, timestamp, runId, current.status);
+        .run(nextStatus, nextStatus, timestamp, nextStatus, timestamp, nextStatus, timestamp, runId, current.status);
       if (result.changes !== 1) throw conflict("STALE_RUN", "Run status changed before the action could be applied");
+      const reconciled = isTerminalRun(nextStatus)
+        ? this.finalizeRunChildrenUnsafe(runId, nextStatus, timestamp, actor.id)
+        : null;
       this.insertAuditUnsafe(actor, `run.${input.action}`, "run", runId, input.reason ?? null, {
         from: current.status,
         to: nextStatus,
+        reconciled,
       });
       return this.insertEventUnsafe({
         runId,
@@ -931,16 +939,22 @@ export class ControlPlaneStore {
         unblock_condition = CASE WHEN ? = 'blocked' THEN ? ELSE NULL END,
         started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
         finished_at = CASE WHEN ? THEN ? ELSE NULL END,
+        current_stage_id = CASE WHEN ? THEN NULL ELSE current_stage_id END,
         updated_at = ?, version = version + 1 WHERE id = ? AND status = ?`)
         .run(input.status, input.status, safeReason ?? null,
           input.status, safeBlockedOwner ?? null, input.status, safeUnblockCondition ?? null,
-          input.status, timestamp, terminal ? 1 : 0, timestamp, timestamp, runId, lockedCurrent.status);
+          input.status, timestamp, terminal ? 1 : 0, timestamp, terminal ? 1 : 0,
+          timestamp, runId, lockedCurrent.status);
       if (result.changes !== 1) throw conflict("STALE_RUN", "Run changed before the transition could be applied");
+      const reconciled = terminal
+        ? this.finalizeRunChildrenUnsafe(runId, input.status, timestamp, actor.id)
+        : null;
       this.insertAuditUnsafe(actor, "run.transition", "run", runId, safeReason ?? null, {
         from: lockedCurrent.status,
         to: input.status,
         blockedOwner: safeBlockedOwner,
         unblockCondition: safeUnblockCondition,
+        reconciled,
       });
       return this.insertEventUnsafe({
         runId,
@@ -966,6 +980,9 @@ export class ControlPlaneStore {
     if ((run.breaker.status === "open" || run.status === "blocked") && !["failed", "blocked"].includes(status)) {
       throw conflict("BREAKER_OPEN", "Stage progress is stopped until the circuit breaker is overridden and the run resumes");
     }
+    if (run.status !== "running" && !(run.status === "blocked" && ["failed", "blocked"].includes(status))) {
+      throw conflict("RUN_NOT_ACTIVE", `Stages can only progress while the run is running; current status is '${run.status}'`);
+    }
     const row = this.db.prepare("SELECT * FROM stages WHERE id = ? AND run_id = ?").get(stageId, runId) as Row | undefined;
     if (!row) throw notFound("Stage", stageId);
     const current = mapStage(row);
@@ -985,6 +1002,30 @@ export class ControlPlaneStore {
     const terminal = ["passed", "rejected", "failed", "skipped"].includes(status);
     const duration = terminal && current.startedAt ? Math.max(Date.parse(timestamp) - Date.parse(current.startedAt), 0) : null;
     const event = transaction(this.db, () => {
+      const lockedRow = this.db.prepare("SELECT * FROM stages WHERE id = ? AND run_id = ?").get(stageId, runId) as Row | undefined;
+      if (!lockedRow || lockedRow.status !== current.status) {
+        throw conflict("STALE_STAGE", "Stage changed before the transition could be applied");
+      }
+      if (["active", "blocked", "skipped"].includes(status)) {
+        const unfinishedPrevious = this.db.prepare(`SELECT key, status FROM stages
+          WHERE run_id = ? AND position < ? AND status NOT IN ('passed','skipped') ORDER BY position LIMIT 1`)
+          .get(runId, lockedRow.position) as Row | undefined;
+        if (unfinishedPrevious) {
+          throw conflict("STAGE_ORDER", `Stage '${lockedRow.key}' cannot start before '${unfinishedPrevious.key}' is complete`, {
+            previousStage: { key: unfinishedPrevious.key, status: unfinishedPrevious.status },
+          });
+        }
+      }
+      if (["active", "waiting", "blocked"].includes(status)) {
+        const otherOpen = this.db.prepare(`SELECT id, key, status FROM stages
+          WHERE run_id = ? AND id <> ? AND status IN ('active','waiting','blocked') ORDER BY position LIMIT 1`)
+          .get(runId, stageId) as Row | undefined;
+        if (otherOpen) {
+          throw conflict("ACTIVE_STAGE_EXISTS", `Stage '${otherOpen.key}' is already ${otherOpen.status}`, {
+            stage: { id: otherOpen.id, key: otherOpen.key, status: otherOpen.status },
+          });
+        }
+      }
       const result = this.db.prepare(`UPDATE stages SET status = ?,
         started_at = CASE WHEN ? = 'active' AND started_at IS NULL THEN ? ELSE started_at END,
         finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
@@ -995,8 +1036,11 @@ export class ControlPlaneStore {
         .run(status, status, timestamp, terminal ? 1 : 0, timestamp, duration,
           status, safeReason ?? null, status, safeReason ?? null, stageId, runId, current.status);
       if (result.changes !== 1) throw conflict("STALE_STAGE", "Stage changed before the transition could be applied");
-      this.db.prepare(`UPDATE runs SET current_stage_id = CASE WHEN ? IN ('active','waiting','blocked') THEN ? ELSE current_stage_id END,
-        updated_at = ?, version = version + 1 WHERE id = ?`).run(status, stageId, timestamp, runId);
+      this.db.prepare(`UPDATE runs SET current_stage_id = CASE
+          WHEN ? IN ('active','waiting','blocked') THEN ?
+          WHEN current_stage_id = ? THEN NULL
+          ELSE current_stage_id END,
+        updated_at = ?, version = version + 1 WHERE id = ?`).run(status, stageId, stageId, timestamp, runId);
       this.insertAuditUnsafe(actor, "stage.transition", "stage", stageId, safeReason ?? null, { from: current.status, to: status });
       return this.insertEventUnsafe({
         runId,
@@ -1013,6 +1057,51 @@ export class ControlPlaneStore {
     this.eventHub.publish(event);
     const updated = this.db.prepare("SELECT * FROM stages WHERE id = ?").get(stageId) as Row;
     return mapStage(updated);
+  }
+
+  private finalizeRunChildrenUnsafe(
+    runId: string,
+    status: RunStatus,
+    timestamp: string,
+    actorId: string,
+  ): { attempts: number; stages: number; agents: number; approvals: number; worktrees: number } {
+    let attempts = 0;
+    let stages = 0;
+    if (status !== "succeeded") {
+      const attemptStatus = status === "cancelled" ? "cancelled" : "failure";
+      attempts = Number(this.db.prepare(`UPDATE attempts SET status = ?, finished_at = ?, version = version + 1
+        WHERE run_id = ? AND status = 'running'`).run(attemptStatus, timestamp, runId).changes);
+
+      const openStages = this.db.prepare(`SELECT id, status, started_at FROM stages
+        WHERE run_id = ? AND status IN ('active','waiting','blocked')`).all(runId) as Row[];
+      const finishStage = this.db.prepare(`UPDATE stages SET status = ?, finished_at = ?, duration_ms = ?,
+        waiting_reason = NULL, skip_reason = ?, version = version + 1 WHERE id = ?`);
+      for (const stage of openStages) {
+        const nextStatus = status === "cancelled" ? "skipped" : "failed";
+        const duration = stage.started_at
+          ? Math.max(Date.parse(timestamp) - Date.parse(stage.started_at), 0)
+          : null;
+        finishStage.run(nextStatus, timestamp, duration,
+          nextStatus === "skipped" ? `Run ${status}` : null, stage.id);
+        stages += 1;
+      }
+      stages += Number(this.db.prepare(`UPDATE stages SET status = 'skipped', finished_at = ?,
+        skip_reason = ?, version = version + 1 WHERE run_id = ? AND status = 'pending'`)
+        .run(timestamp, `Run ${status} before this stage`, runId).changes);
+    }
+
+    const terminalAgentStatus = status === "failed" || status === "timed_out" || status === "capped"
+      ? "error"
+      : "finished";
+    const agents = Number(this.db.prepare(`UPDATE agents SET status = ?, current_action = ?, last_heartbeat_at = ?
+      WHERE current_run_id = ? AND status IN ('starting','running','waiting')`)
+      .run(terminalAgentStatus, `Run ${status}`, timestamp, runId).changes);
+    const approvals = Number(this.db.prepare(`UPDATE approvals SET status = 'revoked', decided_by = ?, decided_at = ?,
+      decision_reason = ?, version = version + 1 WHERE run_id = ? AND status = 'pending'`)
+      .run(actorId, timestamp, `Run reached terminal status '${status}'`, runId).changes);
+    const worktrees = Number(this.db.prepare(`UPDATE worktrees SET status = 'stale', updated_at = ?, version = version + 1
+      WHERE run_id = ? AND status = 'active'`).run(timestamp, runId).changes);
+    return { attempts, stages, agents, approvals, worktrees };
   }
 
   ingestRuntimeFact(runId: string, fact: RuntimeFactInput, actor: Actor): RuntimeFactReceipt {
@@ -1512,6 +1601,7 @@ export class ControlPlaneStore {
       }
       seenResults.add(result.requirementId);
       const evidenceIds = [...new Set(result.evidenceIds)];
+      let hasDeterministicRuntimeEvidence = false;
       if (result.status === "pass" && evidenceIds.length === 0) {
         throw new HttpError(422, "INVALID_REQUIREMENT_RESULT", `Passed requirement ${result.requirementId} must cite evidence`);
       }
@@ -1530,6 +1620,11 @@ export class ControlPlaneStore {
         if (evidence.artifactDigest && evidence.artifactDigest !== input.artifactDigest) {
           throw new HttpError(422, "INVALID_REQUIREMENT_RESULT", `Evidence ${evidenceId} does not match the reviewed artifact`);
         }
+        hasDeterministicRuntimeEvidence ||= isDeterministicRuntimeEvidence(evidence, attempt);
+      }
+      if (result.status === "pass" && !hasDeterministicRuntimeEvidence) {
+        throw new HttpError(422, "DETERMINISTIC_EVIDENCE_REQUIRED",
+          `Passed requirement ${result.requirementId} must cite a successful runtime command or test for the current artifact`);
       }
       return { ...result, evidenceIds, note: safeText(result.note) };
     });
@@ -1594,8 +1689,12 @@ export class ControlPlaneStore {
     const existingRow = this.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id) as Row | undefined;
     if (!existingRow) throw notFound("Approval", id);
     const existing = mapApproval(existingRow);
-    if (this.getRun(existing.runId).sourceMode === "snapshot") {
+    const run = this.getRun(existing.runId);
+    if (run.sourceMode === "snapshot") {
       throw conflict("SNAPSHOT_READ_ONLY", "Imported snapshot runs are read-only");
+    }
+    if (isTerminalRun(run.status)) {
+      throw conflict("TERMINAL_RUN", `Approvals cannot be decided after run '${existing.runId}' reaches '${run.status}'`);
     }
     if (existing.status !== "pending") {
       throw conflict("APPROVAL_DECIDED", `Approval was already ${existing.status}`, { approval: existing });
@@ -1690,8 +1789,10 @@ export class ControlPlaneStore {
       }
       const trigger = `Budget exhausted: ${Math.round(maxPercent)}% of bounded allowance`;
       this.db.prepare(`UPDATE runs SET tokens_used = ?, cost_used_usd = ?, iterations_used = ?, status = 'capped',
-        breaker_status = 'open', breaker_trigger = ?, breaker_opened_at = ?, finished_at = ?, updated_at = ?, version = version + 1
+        breaker_status = 'open', breaker_trigger = ?, breaker_opened_at = ?, finished_at = ?, current_stage_id = NULL,
+        updated_at = ?, version = version + 1
         WHERE id = ?`).run(requested.tokens, requested.cost, requested.iterations, trigger, timestamp, timestamp, timestamp, event.runId);
+      this.finalizeRunChildrenUnsafe(event.runId, "capped", timestamp, "controller");
       this.insertAuditUnsafe({ id: "controller", name: "Controller", role: "admin" }, "breaker.open", "run", event.runId,
         trigger, { sourceEventId: event.id, tokensUsed: requested.tokens, costUsedUsd: requested.cost, iterationsUsed: requested.iterations });
       return [this.insertEventUnsafe({

@@ -45,7 +45,7 @@ test("creates a run, marks it running, and pauses it through audited controls", 
   await expect(page).toHaveURL(/\/runs\/[0-9a-f-]+$/);
   await expect(page.getByRole("heading", { name: objective })).toBeVisible();
   await expect(page.getByRole("button", { name: "Mark running", exact: true })).toBeVisible();
-  await expect(page.getByText(/--cwd '\/tmp\/e2e-control-plane'/)).toBeVisible();
+  await expect(page.getByText(/--cwd \/tmp\/e2e-control-plane/)).toBeVisible();
 
   await page.getByRole("button", { name: "Mark running", exact: true }).click();
   await expect(page.getByText(/does not launch Codex, Claude, or another process/i)).toBeVisible();

@@ -63,10 +63,17 @@ cd loop-engineering
 npm run admin
 ```
 
-Open <http://127.0.0.1:5173>. The first command installs the Admin workspace
-dependencies and creates a local SQLite database automatically. Node.js 22.13+
-is the only prerequisite; Docker, Rancher, cloud services, and a separate
-database are not required.
+Open <http://127.0.0.1:8787>. The command installs dependencies when needed,
+builds the Admin, and starts one local server for the API and UI. A fresh
+SQLite database contains only the required settings and the reusable General
+development loop; it does not invent runs, agents, events, or approvals.
+Node.js 22.13+ is the only prerequisite; Docker, Rancher, cloud services, and a
+separate database are not required.
+
+Use `npm run admin -- --help` for local options. For example,
+`npm run admin -- --port 9000 --db ./my-admin.db` selects another port and
+database. `npm run admin -- --demo` uses persistent read-only sample snapshots
+in a separate `.loop-admin/demo.db` and never seeds the operational database.
 
 Create a run in the UI or CLI, then connect any local runner through the
 built-in CLI or command wrapper:

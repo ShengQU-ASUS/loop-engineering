@@ -41,6 +41,7 @@ function GlobalPauseControl({ disabled = false }: { disabled?: boolean }) {
   const Icon = paused ? CirclePlay : CirclePause;
   const unavailableReason = disabled ? "Connect the local API to control workspace dispatch"
     : !access.ready ? "Waiting for the local session"
+    : access.isDemo ? "Sample workspace is read-only"
     : !access.canOperate ? "Operator role required to control workspace dispatch"
     : query.isPending ? "Loading workspace dispatch state"
     : query.error ? "Workspace dispatch state is unavailable"

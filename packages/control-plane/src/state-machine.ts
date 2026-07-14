@@ -77,6 +77,25 @@ export class CompletionGuardError extends Error {
   }
 }
 
+export function isDeterministicRuntimeEvidence(
+  evidence: EvidenceRecord,
+  attempt: Pick<AttemptRecord, "id" | "artifactDigest">,
+  now = Date.now(),
+): boolean {
+  const expiresAt = evidence.expiresAt === null ? null : Date.parse(evidence.expiresAt);
+
+  return evidence.status === "pass"
+    && evidence.provenance === "runtime"
+    && (evidence.kind === "command" || evidence.kind === "test")
+    && typeof evidence.command === "string"
+    && evidence.command.trim().length > 0
+    && evidence.exitCode === 0
+    && evidence.attemptId === attempt.id
+    && evidence.artifactDigest !== null
+    && evidence.artifactDigest === attempt.artifactDigest
+    && (expiresAt === null || (Number.isFinite(expiresAt) && expiresAt > now));
+}
+
 export function assertRunCanSucceed(input: {
   requirements: RequirementRecord[];
   evidence: EvidenceRecord[];
@@ -114,6 +133,7 @@ export function assertRunCanSucceed(input: {
     if (result.evidenceIds.length === 0) {
       throw new CompletionGuardError(`Requirement ${requirement.id} has no cited evidence`);
     }
+    let hasDeterministicRuntimeEvidence = false;
     for (const evidenceId of result.evidenceIds) {
       const item = evidenceById.get(evidenceId);
       if (!item || item.requirementId !== requirement.id || item.status !== "pass") {
@@ -125,6 +145,16 @@ export function assertRunCanSucceed(input: {
       if (item.artifactDigest && item.artifactDigest !== input.currentAttempt.artifactDigest) {
         throw new CompletionGuardError(`Requirement ${requirement.id} evidence does not match the current artifact`);
       }
+      hasDeterministicRuntimeEvidence ||= isDeterministicRuntimeEvidence(
+        item,
+        input.currentAttempt,
+        now,
+      );
+    }
+    if (!hasDeterministicRuntimeEvidence) {
+      throw new CompletionGuardError(
+        `Requirement ${requirement.id} has no deterministic runtime evidence for the current artifact`,
+      );
     }
   }
 }

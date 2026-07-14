@@ -87,6 +87,10 @@ function RunWorkspace({ detail, demo, envelope, stream }: { detail: RunDetailRes
   const submitAction = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (action) mutation.mutate({ action, reason: String(new FormData(event.currentTarget).get("reason")) }); };
   const currentAgent = detail.agents.find((agent) => agent.status === "running");
   const activeAttempt = [...detail.attempts].reverse().find((attempt) => attempt.status === "running");
+  const currentStage = detail.stages.find((stage) => stage.id === run.currentStageId);
+  const awaitingIndependentChecker = Boolean(
+    activeAttempt?.checkerStatus === "pending" && currentStage?.role === "maker" && currentStage.status === "waiting",
+  );
   const latestEvent = detail.events.reduce((latest, event) => !latest || event.sequence > latest.sequence ? event : latest, detail.events[0]);
   const availableActions = actionsFor(run);
   const currentRequirements = detail.requirements.filter((requirement) => !requirement.supersededAt);
@@ -109,13 +113,14 @@ function RunWorkspace({ detail, demo, envelope, stream }: { detail: RunDetailRes
     {run.sourceMode === "snapshot" && <Callout tone="warn" title="Read-only snapshot">This run was imported from local state files. It is not live telemetry and control actions are unavailable.</Callout>}
     {run.status === "blocked" && <Callout tone="bad" title={`Blocked: ${run.blockedOwner ?? "Owner required"}`}>{run.unblockCondition ?? "No explicit unblock condition was recorded."}</Callout>}
     {run.waitingReason && run.status === "waiting" && <Callout tone="warn" title="Waiting for progress">{run.waitingReason}</Callout>}
-    {run.sourceMode === "managed" && ["queued", "running", "waiting", "paused"].includes(run.status) && !currentAgent && <RunnerAttachPanel run={run} />}
+    {awaitingIndependentChecker && activeAttempt && <Callout tone="info" title="Awaiting independent checker">Maker attempt {activeAttempt.number} has finished and no maker process is active. Review the immutable artifact in a separate checker session, then submit its digest-bound verdict with <code>npm run admin:cli -- verdict --run {commandToken(run.id)} --file checker-verdict.json</code>.</Callout>}
+    {run.sourceMode === "managed" && ["queued", "running", "waiting", "paused"].includes(run.status) && !currentAgent && !awaitingIndependentChecker && <RunnerAttachPanel run={run} />}
     <section className="run-objective" aria-labelledby="objective-heading"><div><span className="section-kicker">Execution contract</span><h2 id="objective-heading">Objective & acceptance requirements</h2><p>{run.goal}</p><div className="objective-meta"><span>{run.startedAt ? `Started ${relativeTime(run.startedAt)}` : "Not started"}</span><span>Updated {relativeTime(run.updatedAt)}</span><span>Revision {Math.max(0, ...detail.requirements.map((item) => item.revision))}</span></div></div><div className="requirement-list">{currentRequirements.length ? currentRequirements.map((requirement) => <div key={requirement.id} className={`requirement-${requirement.status}`}>{requirement.status === "pass" ? <CheckCircle2 size={16} /> : requirement.status === "fail" ? <XCircle size={16} /> : requirement.status === "missing" ? <AlertOctagon size={16} /> : <Clock3 size={16} />}<span><strong>{requirement.title}</strong><small>{requirement.acceptanceCriteria}</small></span><Badge value={requirement.status} tone={requirement.status === "pass" ? "good" : requirement.status === "fail" ? "bad" : "warn"} /></div>) : <div className="requirement-missing"><AlertOctagon size={16} /><span><strong>No signed requirements</strong><small>Completion is blocked until acceptance criteria are recorded.</small></span></div>}</div>{previousRequirements.length > 0 && <details className="revision-history"><summary>{previousRequirements.length} superseded requirement {previousRequirements.length === 1 ? "revision" : "revisions"}</summary><div>{previousRequirements.map((requirement) => <div key={requirement.id}><span>Revision {requirement.revision}</span><strong>{requirement.title}</strong><small>Superseded {relativeTime(requirement.supersededAt)}</small></div>)}</div></details>}</section>
     <StageRail stages={detail.stages} />
     <div className="run-layout">
       <div className="run-main">
         <Panel className="current-work" title="Current observable work" description="Latest action reported by runtime telemetry, not private reasoning." actions={<span className={cx("live-indicator", stream !== "live" && "live-delayed")}><span /> {demo ? "Demo" : stream === "polling" ? "Polling" : titleCase(stream)}</span>}>
-          {currentAgent ? <div className="current-work-body"><div className="action-symbol"><Code2 size={22} /></div><div className="action-detail"><span>{currentAgent.name} · {currentAgent.runtime} · {currentAgent.model}</span><strong>{currentAgent.currentAction ?? "Waiting for the next observable action"}</strong><div><code>{currentAgent.worktreePath ?? "No worktree"}</code><span>Heartbeat {relativeTime(currentAgent.lastHeartbeatAt)}</span></div></div></div> : <EmptyState title="No active agent" detail="The controller has not assigned an agent to this stage." />}
+          {currentAgent ? <div className="current-work-body"><div className="action-symbol"><Code2 size={22} /></div><div className="action-detail"><span>{currentAgent.name} · {currentAgent.runtime} · {currentAgent.model}</span><strong>{currentAgent.currentAction ?? "Waiting for the next observable action"}</strong><div><code>{currentAgent.worktreePath ?? "No worktree"}</code><span>Heartbeat {relativeTime(currentAgent.lastHeartbeatAt)}</span></div></div></div> : awaitingIndependentChecker && activeAttempt ? <EmptyState title="No active process" detail={`Maker attempt ${activeAttempt.number} is complete; independent checker telemetry is pending.`} /> : <EmptyState title="No active agent" detail="The controller has not assigned an agent to this stage." />}
           {latestEvent && <div className="latest-command"><Terminal size={15} /><span>{latestEvent.message}</span><time>{relativeTime(latestEvent.occurredAt)}</time></div>}
         </Panel>
         <div className="detail-tabs" role="tablist" aria-label="Run detail sections">
@@ -141,15 +146,8 @@ function RunWorkspace({ detail, demo, envelope, stream }: { detail: RunDetailRes
 
 function RunnerAttachPanel({ run }: { run: RunRecord }) {
   const [copied, setCopied] = useState(false);
-  const runtime = run.runtime.toLowerCase();
-  const command = runtime.includes("claude") ? `claude -p ${shellQuote(run.goal)}`
-    : runtime.includes("gemini") ? `gemini -p ${shellQuote(run.goal)}`
-    : runtime.includes("openhands") ? `openhands ${shellQuote(run.goal)}`
-    : runtime.includes("codex") ? `codex exec ${shellQuote(run.goal)}`
-    : "npm test";
-  const cwd = run.repositoryPath ? ` --cwd ${shellQuote(run.repositoryPath)}` : "";
-  const stage = run.currentStageId ? ` --stage ${shellQuote(run.currentStageId)}` : "";
-  const invocation = `npm run admin:run -- --run ${shellQuote(run.id)}${stage}${cwd} -- ${command}`;
+  const cwd = run.repositoryPath ? ` --cwd ${commandToken(run.repositoryPath)}` : "";
+  const invocation = `npm run admin:run -- --run ${commandToken(run.id)}${cwd} -- npm test`;
   const copy = async () => {
     await navigator.clipboard?.writeText(invocation);
     setCopied(true);
@@ -157,12 +155,12 @@ function RunnerAttachPanel({ run }: { run: RunRecord }) {
 
   return <section className="runner-attach" aria-labelledby="runner-attach-heading">
     <div className="runner-attach-icon"><Terminal size={20} aria-hidden="true" /></div>
-    <div className="runner-attach-body"><span className="section-kicker">Local runner</span><h2 id="runner-attach-heading">Attach real execution telemetry</h2><p>Run this from the cloned Admin repository. The wrapper launches the command locally and streams observable stdout, stderr, exit status, and duration into this run. Replace everything after <code>--</code> with Codex, Claude, or any command.</p><div className="runner-command"><code>{invocation}</code><button type="button" className="icon-button" title="Copy runner command" aria-label="Copy runner command" onClick={() => void copy()}><Clipboard size={16} /></button></div><span className="copy-status" role="status" aria-live="polite">{copied ? "Runner command copied" : "The Admin records telemetry; it does not launch a process by changing run status."}</span></div>
+    <div className="runner-attach-body"><span className="section-kicker">Local runner</span><h2 id="runner-attach-heading">Attach real execution telemetry</h2><p>Run this from the cloned Admin repository. The runner starts queued work, advances to the maker stage, registers the agent and attempt, captures terminal output plus digest-bound artifact, verification, and requirement evidence, then stops at the independent checker gate. Replace <code>npm test</code> with Codex, Claude, or any command.</p><div className="runner-command"><code>{invocation}</code><button type="button" className="icon-button" title="Copy runner command" aria-label="Copy runner command" onClick={() => void copy()}><Clipboard size={16} /></button></div><span className="copy-status" role="status" aria-live="polite">{copied ? "Runner command copied" : "The command runs locally; the Admin records its observable lifecycle and evidence."}</span></div>
   </section>;
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
+function commandToken(value: string): string {
+  return /^[A-Za-z0-9_./:@%+,=\\-]+$/.test(value) ? value : JSON.stringify(value);
 }
 
 function StageRail({ stages }: { stages: StageRecord[] }) {

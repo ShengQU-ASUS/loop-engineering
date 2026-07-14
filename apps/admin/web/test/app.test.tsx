@@ -4,15 +4,49 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/app";
 import { NewRunButton } from "../src/new-run";
 import { ApprovalsPage } from "../src/pages";
-import { approvals, loops } from "../src/mock-data";
+import { approvals, loops, runDetail } from "../src/mock-data";
 import { jsonResponse, renderApp } from "./test-utils";
 
 afterEach(() => vi.restoreAllMocks());
 
-const adminSession = { user: { id: "local-admin", name: "Local admin" }, role: "admin", permissions: { read: true, operate: true, administer: true } };
+const adminSession = { user: { id: "local-admin", name: "Local admin" }, role: "admin", dataMode: "operational", permissions: { read: true, operate: true, administer: true } };
 const unpaused = { paused: false, version: 1, changedAt: new Date().toISOString(), changedBy: "system", reason: "Ready" };
 
+function stubRunDetail(detail: typeof runDetail) {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const path = String(input);
+    if (path === "/api/session") return jsonResponse(adminSession);
+    if (path === "/api/settings/global-pause") return jsonResponse(unpaused);
+    if (path === `/api/runs/${detail.run.id}`) return jsonResponse(detail);
+    return jsonResponse({ error: "not found" }, 404);
+  }));
+}
+
 describe("Loop Engineering Admin", () => {
+  it("shows a fresh operational workspace as connected before its first event", async () => {
+    window.history.pushState({}, "", "/");
+    const emptyOverview = {
+      ...(await import("../src/mock-data")).overview,
+      connection: { mode: "managed" as const, status: "connected" as const, lastEventAt: null, globalPause: false },
+      activeRuns: [],
+      recentEvents: [],
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/session") return jsonResponse(adminSession);
+      if (path === "/api/overview") return jsonResponse(emptyOverview);
+      if (path === "/api/settings/global-pause") return jsonResponse(unpaused);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+    renderApp(<App />);
+
+    expect(await screen.findByText("Runtime telemetry")).toBeInTheDocument();
+    expect(screen.getByText("Connected")).toBeInTheDocument();
+    expect(screen.getByText("Last event Never")).toBeInTheDocument();
+    expect(screen.queryByText("Read-only snapshot")).not.toBeInTheDocument();
+    expect(screen.queryByText("Connecting to control plane")).not.toBeInTheDocument();
+  });
+
   it("falls back to clearly labelled demo data when the local API is offline", async () => {
     window.history.pushState({}, "", "/?demo=1");
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("connection refused")));
@@ -31,6 +65,24 @@ describe("Loop Engineering Admin", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("connection refused");
     expect(screen.queryByText("Add resumable uploads with clear recovery status and operator-safe retry controls")).not.toBeInTheDocument();
+  });
+
+  it("labels a persisted sample workspace and disables operational controls", async () => {
+    window.history.pushState({}, "", "/");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/session") return jsonResponse({ ...adminSession, demo: true, dataMode: "demo" });
+      if (path === "/api/overview") return jsonResponse((await import("../src/mock-data")).overview);
+      if (path === "/api/settings/global-pause") return jsonResponse(unpaused);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+    renderApp(<App />);
+
+    expect(await screen.findByText("Sample workspace")).toBeInTheDocument();
+    expect(screen.getByText(/not operational history/i)).toBeInTheDocument();
+    const newRun = screen.getByRole("button", { name: /New run/i });
+    await waitFor(() => expect(newRun).toBeDisabled());
+    expect(newRun).toHaveAttribute("title", "Sample workspace is read-only");
   });
 
   it("exposes objective, stages, attempts, checker separation, and requirement evidence", async () => {
@@ -56,6 +108,55 @@ describe("Loop Engineering Admin", () => {
     expect(screen.getByRole("heading", { name: "Requirement traceability" })).toBeInTheDocument();
     expect(screen.getByText("21 focused state persistence tests passed.")).toBeInTheDocument();
     expect(screen.getByText("No current evidence bound")).toBeInTheDocument();
+  });
+
+  it("lets the local runner discover the maker stage when it is current", async () => {
+    window.history.pushState({}, "", "/");
+    stubRunDetail({ ...runDetail, agents: [], attempts: [] });
+    renderApp(<App />, { route: "/runs/run-2048" });
+
+    const heading = await screen.findByRole("heading", { name: "Attach real execution telemetry" });
+    const command = heading.closest("section")?.querySelector(".runner-command code");
+    expect(command).toHaveTextContent("--run run-2048");
+    expect(command).not.toHaveTextContent("--stage");
+  });
+
+  it("lets the local runner discover the maker stage when another stage is current", async () => {
+    window.history.pushState({}, "", "/");
+    const detail = {
+      ...runDetail,
+      run: { ...runDetail.run, currentStageId: "stage-trigger", currentStageName: "Trigger & intake" },
+      agents: [],
+      attempts: [],
+    };
+    stubRunDetail(detail);
+    renderApp(<App />, { route: "/runs/run-2048" });
+
+    const heading = await screen.findByRole("heading", { name: "Attach real execution telemetry" });
+    const command = heading.closest("section")?.querySelector(".runner-command code");
+    expect(command).not.toHaveTextContent("--stage");
+  });
+
+  it("shows checker handoff instead of another maker command after execution", async () => {
+    window.history.pushState({}, "", "/");
+    const detail = {
+      ...runDetail,
+      stages: runDetail.stages.map((stage) => stage.id === "stage-maker"
+        ? { ...stage, status: "waiting" as const, waitingReason: "Verification recorded; awaiting an independent checker verdict" }
+        : stage),
+      attempts: runDetail.attempts.map((attempt) => attempt.id === "attempt-3"
+        ? { ...attempt, status: "running" as const, checkerStatus: "pending" as const, artifactDigest: "sha256:candidate-ready" }
+        : attempt),
+      agents: [],
+    };
+    stubRunDetail(detail);
+    renderApp(<App />, { route: "/runs/run-2048" });
+
+    expect(await screen.findByText("Awaiting independent checker")).toBeInTheDocument();
+    expect(screen.getByText("No active process")).toBeInTheDocument();
+    expect(screen.getByText(/independent checker telemetry is pending/i)).toBeInTheDocument();
+    expect(screen.getByText((content, element) => element?.tagName === "CODE" && content.includes("npm run admin:cli -- verdict"))).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Attach real execution telemetry" })).not.toBeInTheDocument();
   });
 
   it("builds a general development run with project, runtime, and multiple requirements", async () => {

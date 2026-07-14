@@ -1,8 +1,44 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const DEFAULT_DATABASE_PATH = resolve(process.cwd(), ".loop-admin/control-plane.db");
+export function findWorkspaceRoot(startDirectory: string): string {
+  let directory = resolve(startDirectory);
+
+  while (true) {
+    try {
+      const manifest = JSON.parse(readFileSync(resolve(directory, "package.json"), "utf8")) as {
+        workspaces?: unknown;
+      };
+      const workspaces = manifest.workspaces;
+      if (
+        Array.isArray(workspaces)
+        || (
+          typeof workspaces === "object"
+          && workspaces !== null
+          && "packages" in workspaces
+          && Array.isArray((workspaces as { packages?: unknown }).packages)
+        )
+      ) {
+        return directory;
+      }
+    } catch {
+      // Keep walking until the root workspace manifest is found.
+    }
+
+    const parent = dirname(directory);
+    if (parent === directory) {
+      throw new Error(`Unable to locate the Loop Engineering workspace from ${startDirectory}`);
+    }
+    directory = parent;
+  }
+}
+
+export function resolveDefaultDatabasePath(moduleDirectory = import.meta.dirname): string {
+  return resolve(findWorkspaceRoot(moduleDirectory), ".loop-admin", "control-plane.db");
+}
+
+export const DEFAULT_DATABASE_PATH = resolveDefaultDatabasePath();
 
 const MIGRATIONS = [
   {

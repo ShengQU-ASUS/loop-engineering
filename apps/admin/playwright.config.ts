@@ -26,7 +26,8 @@ export default defineConfig({
     reuseExistingServer: false,
     timeout: 120_000,
     env: {
-      LOOP_ADMIN_DEMO: "1",
+      NODE_ENV: "test",
+      LOOP_ADMIN_E2E_FIXTURE: "1",
       LOOP_ADMIN_DB: databasePath,
       LOOP_ADMIN_PORT: "8793",
     },

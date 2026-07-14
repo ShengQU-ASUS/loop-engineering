@@ -134,6 +134,6 @@ export const mockFor = (path: string): unknown => {
   if (path === "/artifacts") return artifacts;
   if (path === "/audit") return audit;
   if (path === "/settings/global-pause") return { paused: false, version: 1, changedAt: ago(0), changedBy: "system", reason: "Demo workspace" };
-  if (path === "/session") return { user: { id: "local-admin", name: "Local admin" }, role: "admin", demo: true, localOnly: true, permissions: { read: true, operate: true, administer: true } };
+  if (path === "/session") return { user: { id: "local-admin", name: "Local admin" }, role: "admin", demo: true, dataMode: "demo", localOnly: true, permissions: { read: true, operate: true, administer: true } };
   return null;
 };

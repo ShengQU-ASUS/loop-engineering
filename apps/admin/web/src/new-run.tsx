@@ -71,6 +71,7 @@ export function NewRunButton({ loops, disabled = false, disabledReason }: { loop
   const unavailableReason = disabled ? disabledReason ?? "Connect the local API to create a real run"
     : !enabledLoops.length ? "No enabled loop template is available"
     : !access.ready ? "Waiting for the local session"
+    : access.isDemo ? "Sample workspace is read-only"
     : !access.canOperate ? "Operator role required to create a run"
     : !globalPause.ready ? "Waiting for workspace dispatch state"
     : globalPause.paused ? "Resume workspace dispatch before creating a run"

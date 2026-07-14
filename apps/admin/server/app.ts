@@ -22,7 +22,7 @@ import { actorFromRequest, requireBearerToken, requireRole } from "./auth.js";
 import { openDatabase } from "./database.js";
 import { HttpError } from "./errors.js";
 import { encodeSse, EventHub } from "./event-hub.js";
-import { ensureBaseData, seedDemoData } from "./seed.js";
+import { ensureBaseData, getWorkspaceDataMode, seedDemoData } from "./seed.js";
 import { ControlPlaneStore } from "./store.js";
 
 const DEFAULT_STAGES = [
@@ -71,6 +71,8 @@ export interface BuildAppOptions {
   serveStatic?: boolean;
   enableTestAuthHeaders?: boolean;
   authToken?: string;
+  demoRunSourceMode?: "managed" | "snapshot";
+  e2eFixture?: boolean;
 }
 
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
@@ -80,9 +82,28 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const eventHub = new EventHub();
   const store = new ControlPlaneStore(database, eventHub);
   const getActor = (request: FastifyRequest) => actorFromRequest(request, options.enableTestAuthHeaders === true);
-  const demo = options.demo ?? process.env.LOOP_ADMIN_DEMO === "1";
-  if (demo) seedDemoData(database);
-  ensureBaseData(database);
+  if (options.e2eFixture && process.env.NODE_ENV !== "test") {
+    if (ownsDatabase) database.close();
+    throw new Error("Writable E2E fixtures require NODE_ENV=test");
+  }
+  const demoRequested = options.e2eFixture || (options.demo ?? process.env.LOOP_ADMIN_DEMO === "1");
+  let dataMode: "operational" | "demo";
+  try {
+    const existingMode = getWorkspaceDataMode(database);
+    if (demoRequested && existingMode === "operational") {
+      throw new Error("Refusing demo mode for an operational database; use a separate LOOP_ADMIN_DB");
+    }
+    if (demoRequested) seedDemoData(database, { runSourceMode: options.e2eFixture ? "managed" : options.demoRunSourceMode });
+    if (options.e2eFixture) {
+      database.prepare("UPDATE settings SET value = 'operational' WHERE key = 'workspace_data_mode'").run();
+    }
+    dataMode = ensureBaseData(database, demoRequested && !options.e2eFixture ? "demo" : "operational");
+  } catch (error) {
+    if (ownsDatabase) database.close();
+    throw error;
+  }
+  const demo = dataMode === "demo";
+  const demoReadOnly = demo && options.demoRunSourceMode !== "managed";
 
   await app.register(cors, {
     origin(origin, callback) {
@@ -94,6 +115,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   if (options.authToken) {
     app.addHook("onRequest", async (request) => requireBearerToken(request, options.authToken as string));
+  }
+  if (demoReadOnly) {
+    app.addHook("preHandler", async (request) => {
+      if (request.url.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+        throw new HttpError(409, "DEMO_READ_ONLY", "Sample workspace data is read-only; start without --demo for real work");
+      }
+    });
   }
 
   app.setErrorHandler((error, request, reply) => {
@@ -123,12 +151,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       role: actor.role,
       user: { id: actor.id, name: actor.name },
       demo,
+      dataMode,
       localOnly: true,
       authMode: options.authToken ? "bearer" : "local",
       permissions: {
         read: true,
-        operate: actor.role === "operator" || actor.role === "admin",
-        administer: actor.role === "admin",
+        operate: !demoReadOnly && (actor.role === "operator" || actor.role === "admin"),
+        administer: !demoReadOnly && actor.role === "admin",
       },
     };
   });

@@ -3,6 +3,13 @@ import { transaction } from "./database.js";
 
 const SHA_A = "7f3c2d8a11b0952bcb8bd37da18457cfb56f27dd6141268df6f47d3814c379a1";
 const SHA_B = "b8beaf3b612c00a93ed8c9921f03f1dbac2a14fa42ee96407d83caf72d2852cc";
+const DEMO_RUN_IDS = ["run-webhook", "run-release", "run-deps"] as const;
+
+export type WorkspaceDataMode = "operational" | "demo";
+
+interface DemoSeedOptions {
+  runSourceMode?: "managed" | "snapshot";
+}
 
 function ago(minutes: number): string {
   return new Date(Date.now() - minutes * 60_000).toISOString();
@@ -12,19 +19,29 @@ function ahead(minutes: number): string {
   return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
-export function seedDemoData(db: DatabaseSync): boolean {
-  const count = db.prepare("SELECT COUNT(*) AS count FROM loops").get() as { count: number };
-  if (count.count > 0) return false;
+export function seedDemoData(db: DatabaseSync, options: DemoSeedOptions = {}): boolean {
+  const existingMode = getWorkspaceDataMode(db);
+  if (existingMode === "operational") {
+    throw new Error("Refusing to add demo records to an operational workspace database");
+  }
+  const count = db.prepare("SELECT COUNT(*) AS count FROM runs").get() as { count: number };
+  if (count.count > 0) {
+    if (existingMode === "demo" || hasLegacyDemoSeed(db)) return false;
+    throw new Error("Refusing to label a database with existing operational runs as demo");
+  }
+  const runSourceMode = options.runSourceMode ?? "snapshot";
+  const recordProvenance = runSourceMode === "snapshot" ? "snapshot" : "runtime";
 
   transaction(db, () => {
-    const insertSetting = db.prepare("INSERT INTO settings(key, value) VALUES (?, ?)");
+    const insertSetting = db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)");
     insertSetting.run("global_pause", "false");
     insertSetting.run("global_pause_version", "1");
     insertSetting.run("global_pause_changed_at", ago(0));
     insertSetting.run("global_pause_changed_by", "system");
     insertSetting.run("global_pause_reason", "Initial local state");
+    insertSetting.run("workspace_data_mode", "demo");
 
-    const insertLoop = db.prepare(`INSERT INTO loops(id, name, description, automation_level, owner, schedule,
+    const insertLoop = db.prepare(`INSERT OR IGNORE INTO loops(id, name, description, automation_level, owner, schedule,
       risk, readiness_score, enabled, last_run_at, next_run_at, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     insertLoop.run("general-development", "General development", "Requirement-driven implementation with deterministic checks and an independent checker.",
       "L2", "Local user", null, "medium", 92, 1, ago(15), null, "policy-2026.07");
@@ -44,18 +61,18 @@ export function seedDemoData(db: DatabaseSync): boolean {
     insertRun.run("run-webhook", "general-development",
       "Add resilient webhook delivery with idempotency, bounded retries, operator-visible evidence, and complete tests.",
       "running", "L2", "medium", "stage-webhook-maker", null, null, null,
-      ago(52), ago(1), null, ago(1), 9, "managed", 120_000, 43_810, 18, 5.24, 12, 2, 80,
+      ago(52), ago(1), null, ago(1), 9, runSourceMode, 120_000, 43_810, 18, 5.24, 12, 2, 80,
       "closed", 0, 3, 0, 5, null, null, null, null);
     insertRun.run("run-release", "release-readiness",
       "Verify the desktop release candidate against signed acceptance requirements and prepare the publish decision.",
       "waiting", "L2", "high", "stage-release-human", "Waiting for a scoped publish approval", null, null,
-      ago(138), ago(4), null, ago(4), 8, "managed", 90_000, 68_240, 20, 10.82, 10, 3, 75,
+      ago(138), ago(4), null, ago(4), 8, runSourceMode, 90_000, 68_240, 20, 10.82, 10, 3, 75,
       "warning", 1, 3, 1, 5, "Budget warning threshold reached", null, null, null);
     insertRun.run("run-deps", "dependency-maintenance",
       "Update the HTTP client while preserving proxy behavior, timeout semantics, and supported Node versions.",
       "capped", "L2", "medium", "stage-deps-checker", null, "Maintainer",
       "Choose a compatible client version or revise the Node support requirement", ago(240), ago(65), ago(65), ago(65), 7,
-      "managed", 55_000, 55_000, 10, 9.31, 5, 5, 80, "open", 3, 3, 5, 5,
+      runSourceMode, 55_000, 55_000, 10, 9.31, 5, 5, 80, "open", 3, 3, 5, 5,
       "Iteration and token budgets exhausted after repeated compatibility failures", "ERR_UNSUPPORTED_NODE_RANGE", ago(65), null);
 
     db.prepare("UPDATE runs SET project_name = ?, repository_path = ?, runtime = ?, model = ? WHERE id = ?")
@@ -133,19 +150,19 @@ export function seedDemoData(db: DatabaseSync): boolean {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     insertEvidence.run("evidence-webhook-concurrency", "run-webhook", "req-webhook-idempotency", "attempt-webhook-1", "test", "fail",
       "The test issued sequential duplicates and cannot prove concurrency safety.", "npm test -- webhook-concurrency", 0,
-      "artifact://log/webhook-attempt-1", SHA_A, "agent-checker", "runtime", ago(34), null);
+      "artifact://log/webhook-attempt-1", SHA_A, "agent-checker", recordProvenance, ago(34), null);
     insertEvidence.run("evidence-webhook-unit", "run-webhook", "req-webhook-retry", "attempt-webhook-2", "test", "pass",
       "18 retry boundary tests passed.", "npm test -- webhook-retry", 0, "artifact://log/webhook-attempt-2", SHA_B,
-      "runtime:test-runner", "runtime", ago(3), null);
+      "runtime:test-runner", recordProvenance, ago(3), null);
     insertEvidence.run("evidence-release-tests", "run-release", "req-release-tests", "attempt-release-1", "test", "pass",
       "Unit, integration and end-to-end suites passed: 418 tests.", "npm run test:all", 0, "artifact://log/release-tests", SHA_B,
-      "runtime:test-runner", "runtime", ago(39), ahead(1_440));
+      "runtime:test-runner", recordProvenance, ago(39), ahead(1_440));
     insertEvidence.run("evidence-release-signature", "run-release", "req-release-sign", "attempt-release-1", "command", "pass",
       "Signature validation and SHA-256 comparison passed.", "npm run verify:release", 0, "artifact://log/release-signature", SHA_B,
-      "agent-release-checker", "runtime", ago(22), ahead(1_440));
+      "agent-release-checker", recordProvenance, ago(22), ahead(1_440));
     insertEvidence.run("evidence-deps-node", "run-deps", "req-deps-node", "attempt-deps-3", "test", "fail",
       "Dependency requires Node >=22 while the project supports Node 20.", "npm run test:matrix", 1, "artifact://log/deps-node-matrix", SHA_A,
-      "runtime:test-runner", "runtime", ago(76), null);
+      "runtime:test-runner", recordProvenance, ago(76), null);
 
     const insertVerification = db.prepare(`INSERT INTO verifications(id, attempt_id, name, command, status, exit_code,
       duration_ms, evidence_digest, output_preview) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -210,7 +227,8 @@ export function seedDemoData(db: DatabaseSync): boolean {
     const event = (id: string, runId: string, sequence: number, stageId: string | null, attemptId: string | null,
       type: string, severity: string, message: string, payload: object, provenance: string, actor: string,
       digest: string | null, minutes: number) => insertEvent.run(id, runId, sequence, stageId, attemptId, type, severity,
-        message, JSON.stringify(payload), provenance, actor, null, digest, ago(minutes), ago(minutes));
+        message, JSON.stringify(payload), runSourceMode === "snapshot" ? "snapshot" : provenance,
+        actor, null, digest, ago(minutes), ago(minutes));
     event("event-webhook-1", "run-webhook", 1, "stage-webhook-trigger", null, "run.started", "info", "Run accepted by local controller", {}, "runtime", "controller", null, 52);
     event("event-webhook-2", "run-webhook", 2, "stage-webhook-intake", null, "requirements.signed", "info", "Three acceptance requirements recorded", { count: 3, revision: 1 }, "human", "local-user", null, 48);
     event("event-webhook-3", "run-webhook", 3, "stage-webhook-maker", "attempt-webhook-1", "attempt.started", "info", "Maker attempt 1 started in isolated worktree", { branch: "loop/webhook-attempt-1" }, "runtime", "agent-maker", null, 49);
@@ -250,17 +268,32 @@ export function seedDemoData(db: DatabaseSync): boolean {
   return true;
 }
 
-export function ensureBaseData(db: DatabaseSync): void {
+export function ensureBaseData(db: DatabaseSync, requestedMode: WorkspaceDataMode = "operational"): WorkspaceDataMode {
   db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES ('global_pause', 'false')").run();
   db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES ('global_pause_version', '1')").run();
   db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES ('global_pause_changed_at', ?)").run(new Date().toISOString());
   db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES ('global_pause_changed_by', 'system')").run();
   db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES ('global_pause_reason', 'Initial local state')").run();
+  const inferredMode = hasLegacyDemoSeed(db) ? "demo" : requestedMode;
+  db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES ('workspace_data_mode', ?)").run(inferredMode);
   const count = db.prepare("SELECT COUNT(*) AS count FROM loops").get() as { count: number };
-  if (count.count > 0) return;
-  db.prepare(`INSERT INTO loops(id, name, description, automation_level, owner, schedule,
-    risk, readiness_score, enabled, last_run_at, next_run_at, policy_version)
-    VALUES ('general-development', 'General development',
-      'Requirement-driven implementation with deterministic checks and an independent checker.',
-      'L2', 'Local user', NULL, 'medium', 90, 1, NULL, NULL, 'policy-default')`).run();
+  if (count.count === 0) {
+    db.prepare(`INSERT INTO loops(id, name, description, automation_level, owner, schedule,
+      risk, readiness_score, enabled, last_run_at, next_run_at, policy_version)
+      VALUES ('general-development', 'General development',
+        'Requirement-driven implementation with deterministic checks and an independent checker.',
+        'L2', 'Local user', NULL, 'medium', 90, 1, NULL, NULL, 'policy-default')`).run();
+  }
+  return getWorkspaceDataMode(db) ?? inferredMode;
+}
+
+export function getWorkspaceDataMode(db: DatabaseSync): WorkspaceDataMode | null {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'workspace_data_mode'").get() as { value?: string } | undefined;
+  return row?.value === "demo" || row?.value === "operational" ? row.value : null;
+}
+
+export function hasLegacyDemoSeed(db: DatabaseSync): boolean {
+  const placeholders = DEMO_RUN_IDS.map(() => "?").join(", ");
+  const row = db.prepare(`SELECT COUNT(*) AS count FROM runs WHERE id IN (${placeholders})`).get(...DEMO_RUN_IDS) as { count: number };
+  return row.count === DEMO_RUN_IDS.length;
 }

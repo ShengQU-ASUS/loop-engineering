@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Activity, Archive, Bot, Boxes, CircleGauge, FileCheck2, Menu, Network, ScrollText, Settings2, ShieldCheck, X } from "lucide-react";
+import { Activity, Archive, Bot, Boxes, CircleGauge, FileCheck2, FlaskConical, Menu, Network, ScrollText, Settings2, ShieldCheck, X } from "lucide-react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { useApiQuery } from "./api";
 import { Badge, cx } from "./components";
@@ -43,13 +43,16 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
 export function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const overview = useApiQuery<OverviewResponse>("/overview", { refetchInterval: 5000 });
+  const session = useApiQuery<Session>("/session", { refetchInterval: 5000 });
   const mobileStatus = overview.data?.data.connection.status ?? (overview.error ? "offline" : "connecting");
+  const sampleWorkspace = session.data?.data.dataMode === "demo";
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">Skip to content</a>
     <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
     <div className="main-column">
       <header className="mobile-header"><button className="icon-button" title="Open menu" aria-label="Open navigation" onClick={() => setMenuOpen(true)}><Menu size={20} /></button><Brand /><div className={cx("live-pill", mobileStatus !== "connected" && "live-pill-offline")}><span /> {mobileStatus === "connected" ? "Live" : mobileStatus}</div></header>
       <main id="main-content" tabIndex={-1}>
+        {sampleWorkspace && <div className="sample-workspace-banner" role="status"><FlaskConical size={18} aria-hidden="true" /><div><strong>Sample workspace</strong><span>Read-only snapshot data. Controls are disabled and these records are not operational history.</span></div></div>}
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/loops" element={<LoopsPage />} />
