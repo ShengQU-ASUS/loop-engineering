@@ -26,6 +26,10 @@ temp/
 
 # Build / dist (loop-audit dist is committed for zero-install runs)
 build/
+dist/
+.loop-admin/
+playwright-report/
+test-results/
 **/node_modules/
 !tools/loop-audit/dist/
 !tools/loop-cost/dist/

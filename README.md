@@ -50,6 +50,37 @@ Loop engineering replaces you as the person who prompts the agent — you design
 
 **New here?** [Quickstart (5 min)](docs/QUICKSTART.md) · [Interactive picker](https://cobusgreyling.github.io/loop-engineering/#interactive)
 
+## Admin control plane
+
+This fork includes a local Admin for observing and controlling Loop Engineering
+runs across any software project. It tracks the current stage and public action,
+immutable attempts, maker/checker verification, approvals, budgets, circuit
+breakers, artifacts, agents, worktrees, and the audit ledger.
+
+```bash
+git clone --branch feat/admin-control-plane https://github.com/ShengQU-ASUS/loop-engineering.git
+cd loop-engineering
+npm run admin
+```
+
+Open <http://127.0.0.1:5173>. The first command installs the Admin workspace
+dependencies and creates a local SQLite database automatically. Node.js 22.13+
+is the only prerequisite; Docker, Rancher, cloud services, and a separate
+database are not required.
+
+Create a run in the UI or CLI, then connect any local runner through the
+built-in CLI or command wrapper:
+
+```bash
+npm run admin:cli -- create --goal "Implement searchable run history" \
+  --acceptance "Searching by run ID returns the matching persisted run" \
+  --repo "$PWD" --runtime codex
+npm run admin:run -- --run <run-id> --stage <stage-id> -- npm test
+```
+
+See [Admin setup and integration](apps/admin/README.md) for the event contract,
+configuration, and production-build commands.
+
 For developers using Grok, Claude Code, Codex, Cursor, and other AI coding agents.
 
 <p align="center">
@@ -63,6 +94,7 @@ For developers using Grok, Claude Code, Codex, Cursor, and other AI coding agent
 ## Contents
 
 - [Quickstart (5 min)](docs/QUICKSTART.md)
+- [Admin control plane](#admin-control-plane)
 - [Quick Links](#quick-links)
 - [Why This Matters](#why-this-matters)
 - [The Five Building Blocks + Memory](#the-five-building-blocks--memory)

@@ -1,0 +1,52 @@
+{
+  "name": "@loop-engineering/admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c cyan,green \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "tsx watch server/index.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "npm run build:contracts && npm run build:api && npm run build:web",
+    "build:contracts": "npm run build --workspace @loop-engineering/control-plane",
+    "build:api": "tsc -p tsconfig.server.json",
+    "build:web": "vite build",
+    "start": "node dist/server/index.js",
+    "test": "npm run test:server && npm run test:web",
+    "test:server": "vitest run --config vitest.server.config.ts",
+    "test:web": "vitest run --config vitest.web.config.ts",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/static": "^9.0.0",
+    "@loop-engineering/control-plane": "0.1.0",
+    "@tanstack/react-query": "^5.90.21",
+    "fastify": "^5.7.4",
+    "lucide-react": "^0.563.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.13.0"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.11.0",
+    "@playwright/test": "^1.58.2",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "concurrently": "^9.2.1",
+    "jsdom": "^27.4.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "vitest": "^4.0.18"
+  }
+}

@@ -1,0 +1,27 @@
+import { useApiQuery } from "./api";
+import type { GlobalPauseState, Session } from "./types";
+
+export function useSessionAccess() {
+  const query = useApiQuery<Session>("/session", { refetchInterval: 5_000 });
+  const session = query.data?.data;
+  const roleCanOperate = session?.role === "operator" || session?.role === "admin";
+  const roleCanAdminister = session?.role === "admin";
+
+  return {
+    query,
+    session,
+    ready: Boolean(session) && !query.error,
+    canOperate: session?.permissions?.operate ?? roleCanOperate,
+    canAdminister: session?.permissions?.administer ?? roleCanAdminister,
+  };
+}
+
+export function useGlobalPauseState() {
+  const query = useApiQuery<GlobalPauseState>("/settings/global-pause", { refetchInterval: 5_000 });
+  return {
+    query,
+    state: query.data?.data,
+    ready: Boolean(query.data?.data) && !query.error,
+    paused: query.data?.data.paused ?? false,
+  };
+}

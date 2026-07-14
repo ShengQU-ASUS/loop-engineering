@@ -2,7 +2,25 @@
   "name": "loop-engineering",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
+    "admin": "node scripts/start-admin.mjs",
+    "admin:cli": "node scripts/loop-admin-cli.mjs",
+    "admin:run": "node scripts/loop-admin-run.mjs",
+    "admin:contracts": "npm run build --workspace @loop-engineering/control-plane",
+    "admin:dev": "npm run admin:contracts && npm run dev --workspace @loop-engineering/admin",
+    "admin:build": "npm run build --workspace @loop-engineering/admin",
+    "admin:start": "npm run admin:build && npm run start --workspace @loop-engineering/admin",
+    "admin:test": "npm run admin:contracts && npm run admin:test:cli && npm run test --workspace @loop-engineering/control-plane && npm run test --workspace @loop-engineering/admin",
+    "admin:test:cli": "node --test scripts/loop-admin-cli.test.mjs",
+    "admin:test:e2e": "npm run admin:contracts && npm run test:e2e --workspace @loop-engineering/admin",
+    "admin:typecheck": "npm run admin:contracts && npm run typecheck --workspace @loop-engineering/admin",
     "validate:registry": "node scripts/validate-registry.mjs",
     "check:loop-init": "node scripts/check-loop-init-sync.mjs",
     "test:loop-audit": "cd tools/loop-audit && npm test",
