@@ -8,12 +8,21 @@ export async function expectRealApi(page: Page): Promise<void> {
 }
 
 export async function expectNoPageOverflow(page: Page): Promise<void> {
-  const dimensions = await page.evaluate(() => ({
-    viewportWidth: window.innerWidth,
-    documentWidth: document.documentElement.scrollWidth,
-    bodyWidth: document.body.scrollWidth,
-  }));
+  const dimensions = await page.evaluate(() => {
+    const originalX = window.scrollX;
+    window.scrollTo(document.documentElement.scrollWidth, window.scrollY);
+    const horizontalScroll = window.scrollX;
+    window.scrollTo(originalX, window.scrollY);
+
+    return {
+      viewportWidth: window.innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      bodyWidth: document.body.scrollWidth,
+      horizontalScroll,
+    };
+  });
 
   expect(dimensions.documentWidth, `document overflows ${dimensions.viewportWidth}px viewport`).toBeLessThanOrEqual(dimensions.viewportWidth);
   expect(dimensions.bodyWidth, `body overflows ${dimensions.viewportWidth}px viewport`).toBeLessThanOrEqual(dimensions.viewportWidth);
+  expect(dimensions.horizontalScroll, "page can be scrolled horizontally").toBe(0);
 }

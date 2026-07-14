@@ -6,6 +6,7 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Operational overview" })).toBeVisible();
   await expectRealApi(page);
+  await expect(page.getByRole("button", { name: "Close menu" })).toBeHidden();
 });
 
 test("opens a live run from overview and exposes activity, attempts, and evidence", async ({ page }) => {

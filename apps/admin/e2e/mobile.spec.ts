@@ -15,6 +15,7 @@ test("mobile navigation works at 390px and the core views fit at 390px and 320px
   await page.getByRole("button", { name: "Open navigation" }).click();
   const navigation = page.getByRole("complementary", { name: "Primary navigation" });
   await expect(navigation).toBeVisible();
+  await expect(navigation.getByRole("button", { name: "Close menu" })).toBeVisible();
   await navigation.getByRole("link", { name: /^Runs/ }).click();
   await expect(page.getByRole("heading", { name: "Runs" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Open navigation" })).toBeVisible();
