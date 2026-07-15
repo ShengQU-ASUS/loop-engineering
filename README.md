@@ -57,6 +57,9 @@ runs across any software project. It tracks the current stage and public action,
 immutable attempts, maker/checker verification, approvals, budgets, circuit
 breakers, artifacts, agents, worktrees, and the audit ledger.
 
+Start with the [Admin user guide](docs/admin-user-guide.md) for the step-by-step
+workflow from creating a task through monitoring, checker review, and approval.
+
 ```bash
 git clone --branch feat/admin-control-plane https://github.com/ShengQU-ASUS/loop-engineering.git
 cd loop-engineering

@@ -6,6 +6,10 @@ active, what deterministic evidence exists, why a checker accepted or rejected
 the work, which approvals are waiting, and whether budget or circuit-breaker
 limits have stopped the loop.
 
+For day-to-day operation, begin with the
+[Admin user guide](../../docs/admin-user-guide.md). This document is the setup,
+configuration, and integration reference.
+
 ## Quick start
 
 From the repository root:
