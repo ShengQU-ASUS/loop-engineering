@@ -343,8 +343,8 @@ async function recordManagedResult(exitCode, evidenceDigest) {
       role: "maker",
       runtime: options.runtime || "loop-admin-run",
       model: options.model || "external command",
-      status: "finished",
-      currentAction: "Verification recorded; independent checker required",
+      status: "waiting",
+      currentAction: "Verification recorded; awaiting an independent checker verdict",
       worktreePath: cwd,
     });
     return;

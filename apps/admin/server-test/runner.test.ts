@@ -29,7 +29,7 @@ describe("loop-admin-run", () => {
     expect(result.stderr).toContain("loop-admin telemetry warning:");
   });
 
-  it("drives a successful command to a digest-bound independent-checker gate", async () => {
+  it("keeps a successful maker session waiting through checker and human approval handoff", async () => {
     const managed = await createManagedRun();
     const result = await runRunner(managed.runId, managed.baseUrl, [
       process.execPath,
@@ -39,7 +39,7 @@ describe("loop-admin-run", () => {
     expect(result).toMatchObject({ code: 0 });
     expect(result.stdout).toContain("managed-command-passed");
 
-    const detail = (await app!.inject({ method: "GET", url: `/api/runs/${managed.runId}` })).json();
+    let detail = (await app!.inject({ method: "GET", url: `/api/runs/${managed.runId}` })).json();
     const maker = detail.stages.find((stage: any) => stage.role === "maker");
     expect(detail.run).toMatchObject({
       status: "waiting",
@@ -62,10 +62,102 @@ describe("loop-admin-run", () => {
       artifactDigest: detail.attempts[0].artifactDigest,
     });
     expect(detail.artifacts[0]).toMatchObject({ verificationStatus: "verified", digest: detail.attempts[0].artifactDigest });
-    expect(detail.agents[0]).toMatchObject({ status: "finished", currentAction: expect.stringContaining("checker") });
+    expect(detail.agents[0]).toMatchObject({ status: "waiting", currentAction: expect.stringContaining("checker") });
     expect(detail.events.some((event: any) => event.type === "checker.requested")).toBe(true);
     expect(JSON.stringify(detail)).not.toContain("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
     expect(JSON.stringify(detail)).toContain("[REDACTED]");
+
+    const attempt = detail.attempts[0];
+    const makerAgent = detail.agents[0];
+    const requirement = detail.requirements[0];
+    const evidence = detail.evidence.find((candidate: any) => candidate.requirementId === requirement.id);
+    if (!evidence) throw new Error("Runner did not record requirement evidence");
+    const runtimeFact = (payload: Record<string, unknown>) => app!.inject({
+      method: "POST",
+      url: `/api/runs/${managed.runId}/runtime-facts`,
+      headers: OPERATOR,
+      payload,
+    });
+    expect((await runtimeFact({
+      id: "fact-runner-checker-heartbeat",
+      type: "agent.heartbeat",
+      agentId: "runner-test-checker",
+      sessionId: "runner-test-checker-session",
+      name: "Runner test checker",
+      role: "checker",
+      runtime: "integration-test",
+      model: "test-model",
+      status: "running",
+      currentAction: "Reviewing the runner candidate",
+    })).statusCode).toBe(201);
+    const verdict = await app!.inject({
+      method: "POST",
+      url: `/api/runs/${managed.runId}/checker-verdicts`,
+      headers: OPERATOR,
+      payload: {
+        attemptId: attempt.id,
+        checkerAgentId: "runner-test-checker",
+        checkerSessionId: "runner-test-checker-session",
+        verdict: "approve",
+        summary: "The digest-bound runner evidence satisfies the requirement",
+        artifactDigest: attempt.artifactDigest,
+        requirementResults: [{
+          requirementId: requirement.id,
+          status: "pass",
+          evidenceIds: [evidence.id],
+          note: "The runner command passed against the reviewed artifact",
+        }],
+      },
+    });
+    expect(verdict.statusCode).toBe(201);
+
+    expect((await app!.inject({
+      method: "POST",
+      url: `/api/runs/${managed.runId}/actions`,
+      headers: OPERATOR,
+      payload: { action: "resume", reason: "Independent checker approved the candidate", expectedStatus: "waiting" },
+    })).statusCode).toBe(200);
+    const humanStage = await advanceToHumanGate(app!, managed.runId);
+    expect(humanStage).toMatchObject({ role: "human", status: "active" });
+
+    expect((await runtimeFact({
+      id: "fact-runner-maker-waiting-refresh",
+      type: "agent.heartbeat",
+      agentId: makerAgent.id,
+      sessionId: makerAgent.sessionId,
+      name: makerAgent.name,
+      role: "maker",
+      runtime: makerAgent.runtime,
+      model: makerAgent.model,
+      status: "waiting",
+      currentAction: "Awaiting the scoped human approval decision",
+      worktreePath: makerAgent.worktreePath,
+    })).statusCode).toBe(201);
+    const approval = await runtimeFact({
+      id: "fact-runner-human-approval",
+      type: "approval.requested",
+      approvalId: "runner-human-approval",
+      stageId: humanStage.id,
+      attemptId: attempt.id,
+      requestedByAgentId: makerAgent.id,
+      requestedBySessionId: makerAgent.sessionId,
+      requestedAction: "Apply the verified runner candidate",
+      target: "local working tree",
+      risk: "medium",
+      evidenceDigest: attempt.artifactDigest,
+      makerSummary: "The command and independent checker approved this candidate",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    expect(approval.statusCode).toBe(201);
+
+    detail = (await app!.inject({ method: "GET", url: `/api/runs/${managed.runId}` })).json();
+    expect(detail.agents.find((agent: any) => agent.id === makerAgent.id)).toMatchObject({
+      status: "waiting",
+      currentAction: expect.stringContaining("human approval"),
+    });
+    expect(detail.approvals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "runner-human-approval", status: "pending", evidenceDigest: attempt.artifactDigest }),
+    ]));
   });
 
   it("records a failed command as a retryable immutable attempt", async () => {
@@ -140,6 +232,36 @@ function runWithUnavailableAdmin(expectedCode: number): Promise<{ code: number |
     "-e",
     `process.stdout.write("command-ran-${expectedCode}"); process.exit(${expectedCode})`,
   ]);
+}
+
+async function advanceToHumanGate(app: FastifyInstance, runId: string): Promise<any> {
+  const detail = (await app.inject({ method: "GET", url: `/api/runs/${runId}` })).json();
+  const humanStage = detail.stages.find((stage: any) => stage.role === "human");
+  if (!humanStage) throw new Error("Run has no human approval stage");
+
+  for (const stage of detail.stages.filter((candidate: any) => candidate.position <= humanStage.position)) {
+    if (["passed", "skipped"].includes(stage.status)) continue;
+    if (stage.status === "pending") {
+      const activated = await app.inject({
+        method: "PATCH",
+        url: `/api/runs/${runId}/stages/${stage.id}`,
+        headers: OPERATOR,
+        payload: { status: "active" },
+      });
+      expect(activated.statusCode).toBe(200);
+    }
+    if (stage.id === humanStage.id) break;
+    const passed = await app.inject({
+      method: "PATCH",
+      url: `/api/runs/${runId}/stages/${stage.id}`,
+      headers: OPERATOR,
+      payload: { status: "passed" },
+    });
+    expect(passed.statusCode).toBe(200);
+  }
+
+  const refreshed = (await app.inject({ method: "GET", url: `/api/runs/${runId}` })).json();
+  return refreshed.stages.find((stage: any) => stage.id === humanStage.id);
 }
 
 function runRunner(
